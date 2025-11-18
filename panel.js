@@ -249,7 +249,7 @@ function parseGtmObject(gtmData) {
     let isListener = false; // Flag for sorting
 
     // Listeners check
-    if (['__cl', '__fsl', '__lcl', '__evl', '__ytl', '__tl', '__sdl'].includes(tag.function)) {
+    if (['__cl', '__fsl', '__lcl', '__evl', '__ytl', '__tl', '__sdl', '__hl'].includes(tag.function)) {
         isListener = true;
     }
 
