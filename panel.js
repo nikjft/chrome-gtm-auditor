@@ -1,10 +1,68 @@
 let fullGtmData = null;
 let currentContainerId = '';
 let sandboxFrame;
-// Store detected containers: { "GTM-XXXX": "https://..." }
 let detectedContainers = {}; 
 
-// --- Parsing Helpers (Same as before) ---
+// --- Dictionaries for Human-Readable Output ---
+
+const operatorMap = {
+  '_eq': '=',
+  '_cn': 'contains',
+  '_re': 'matches Regex',
+  '_sw': 'starts with',
+  '_ew': 'ends with',
+  '_lt': '<',
+  '_le': '<=',
+  '_gt': '>',
+  '_ge': '>='
+};
+
+// Map internal GTM variable names to UI names
+const variableNameMap = {
+  'gtm.elementClasses': 'Click Classes',
+  'gtm.elementId': 'Click ID',
+  'gtm.elementTarget': 'Click Target',
+  'gtm.elementUrl': 'Click URL',
+  'gtm.element': 'Click Element',
+  'gtm.triggers': 'Triggers',
+  'gtm.scrollThreshold': 'Scroll Depth Threshold',
+  'gtm.scrollUnits': 'Scroll Depth Units',
+  'gtm.scrollDirection': 'Scroll Direction',
+  'gtm.videoProvider': 'Video Provider',
+  'gtm.videoStatus': 'Video Status',
+  'gtm.videoUrl': 'Video URL',
+  'gtm.videoTitle': 'Video Title',
+  'gtm.videoDuration': 'Video Duration',
+  'gtm.videoCurrentTime': 'Video Current Time',
+  'gtm.videoPercent': 'Video Percent',
+  'gtm.videoVisible': 'Video Visible',
+  'gtm.formId': 'Form ID',
+  'gtm.formClasses': 'Form Classes',
+  'gtm.formUrl': 'Form URL',
+  'gtm.formName': 'Form Name',
+  'gtm.errorMessage': 'Error Message',
+  'gtm.errorUrl': 'Error URL',
+  'gtm.errorLine': 'Error Line'
+};
+
+// Map Event values to Trigger Types
+const eventMap = {
+  'gtm.js': 'Page View',
+  'gtm.dom': 'DOM Ready',
+  'gtm.load': 'Window Loaded',
+  'gtm.click': 'Click (All Elements)',
+  'gtm.linkClick': 'Link Click',
+  'gtm.formSubmit': 'Form Submission',
+  'gtm.timer': 'Timer',
+  'gtm.historyChange': 'History Change',
+  'gtm.scrollDepth': 'Scroll Depth',
+  'gtm.video': 'YouTube Video',
+  'gtm.init': 'Initialization',
+  'gtm.init_consent': 'Consent Initialization'
+};
+
+// --- Helper Functions ---
+
 function findMacroIndices(obj, indices = new Set()) {
   if (Array.isArray(obj)) {
     if (obj[0] === 'macro' && typeof obj[1] === 'number') indices.add(obj[1]);
@@ -13,6 +71,38 @@ function findMacroIndices(obj, indices = new Set()) {
     Object.values(obj).forEach(value => findMacroIndices(value, indices));
   }
   return indices;
+}
+
+function inferTemplateName(tagFunction, permissions) {
+  const perms = permissions[tagFunction];
+  if (!perms) return "Custom Template Tag";
+
+  if (perms.access_globals && perms.access_globals.keys) {
+    const keys = perms.access_globals.keys.map(k => k.key);
+    if (keys.includes('fbq') || keys.includes('_fbq')) return "Facebook Pixel (Template)";
+    if (keys.includes('_hsq')) return "HubSpot (Template)";
+    if (keys.includes('ttq')) return "TikTok Pixel (Template)";
+    if (keys.includes('snaptr')) return "Snapchat Pixel (Template)";
+    if (keys.includes('analytics')) return "Segment (Template)";
+    if (keys.includes('amplitude')) return "Amplitude (Template)";
+    if (keys.includes('mixpanel')) return "Mixpanel (Template)";
+    if (keys.includes('pintrk')) return "Pinterest Tag (Template)";
+    if (keys.includes('lintrk')) return "LinkedIn Insight Tag (Template)";
+    if (keys.includes('twq')) return "Twitter/X Pixel (Template)";
+    if (keys.includes('braze')) return "Braze (Template)";
+    if (keys.includes('hj')) return "Hotjar (Template)";
+    if (keys.includes('rdt')) return "Reddit Pixel (Template)";
+    if (keys.includes('clarity')) return "Microsoft Clarity (Template)";
+  }
+  if (perms.inject_script && perms.inject_script.urls) {
+    const urls = perms.inject_script.urls.join(' ');
+    if (urls.includes('facebook.net')) return "Facebook Pixel (Template)";
+    if (urls.includes('hs-scripts.com')) return "HubSpot (Template)";
+    if (urls.includes('tiktok.com')) return "TikTok Pixel (Template)";
+    if (urls.includes('sc-static.net')) return "Snapchat Pixel (Template)";
+    if (urls.includes('clarity.ms')) return "Microsoft Clarity (Template)";
+  }
+  return "Custom Template Tag";
 }
 
 function getTagName(tag) {
@@ -29,9 +119,7 @@ function getTagName(tag) {
     case "__evl": return "Element Visibility Listener";
     case "__ytl": return "YouTube Video Listener";
     case "__tg": return "Trigger Group";
-    default:
-      if (tag.function.startsWith("__cvt_")) return "Custom Template Tag";
-      return `Custom Tag: ${tag.function}`;
+    default: return `Custom Tag: ${tag.function}`;
   }
 }
 
@@ -39,32 +127,41 @@ function parseGtmObject(gtmData) {
   const resource = gtmData.resource;
   if (!resource) throw new Error("Parsed data does not contain a 'resource' object.");
 
+  const permissions = gtmData.permissions || {};
   const macros = resource.macros || [];
   const predicates = resource.predicates || [];
   const rules = resource.rules || [];
   const tags = resource.tags || [];
 
+  // 1. Parse Macros (Variables)
   const parsedMacros = macros.map((macro, i) => {
     let name = `Unknown Variable (Index ${i})`;
     try {
       switch (macro.function) {
-        case "__v": name = `Data Layer Variable: ${macro.vtp_name}`; break;
-        case "__u": name = `URL Variable: ${macro.vtp_component || 'Full URL'}`; break;
-        case "__e": name = "Built-in: Event Name"; break;
-        case "__gas": name = `Google Analytics Settings: ${macro.vtp_trackingId}`; break;
-        case "__f": name = `Built-in: Referrer`; break;
-        case "__aev": name = `Auto-Event Variable: ${macro.vtp_varType}`; break;
-        case "__jsm": name = "Custom JavaScript Variable"; break;
-        case "__j": name = `JavaScript Variable: ${macro.vtp_name}`; break;
+        case "__v": 
+            // Map known GTM vars to clean names
+            const rawName = macro.vtp_name;
+            name = variableNameMap[rawName] ? `${variableNameMap[rawName]}` : `Data Layer: ${rawName}`; 
+            break;
+        case "__u": name = `URL: ${macro.vtp_component || 'Full URL'}`; break;
+        case "__e": name = "Event Name"; break;
+        case "__gas": name = `GA Settings: ${macro.vtp_trackingId}`; break;
+        case "__f": name = `Referrer`; break;
+        case "__aev": name = `Auto-Event: ${macro.vtp_varType}`; break;
+        case "__jsm": name = "Custom JavaScript"; break;
+        case "__j": name = `JS Variable: ${macro.vtp_name}`; break;
         case "__d": name = `DOM Element: ${macro.vtp_elementSelector}`; break;
         case "__k": name = `1st Party Cookie: ${macro.vtp_name}`; break;
         case "__c": name = `Constant: "${macro.vtp_value}"`; break;
         case "__r": name = "Random Number"; break;
-        case "__smm": name = "Value Map (Lookup Table)"; break;
+        case "__smm": name = "Lookup Table"; break;
         case "__hid": name = "HTML ID"; break;
         default:
-          if (macro.function.startsWith("__cvt_")) name = "Custom Template Variable";
-          else name = `Custom Variable: ${macro.function}`;
+          if (macro.function.startsWith("__cvt_")) {
+            name = inferTemplateName(macro.function, permissions).replace(' (Template)', ''); // Cleaner name for vars
+          } else {
+            name = `Custom Variable: ${macro.function}`;
+          }
       }
     } catch (e) { name = `Error parsing variable ${i}`; }
     return { name: name, raw: macro };
@@ -78,24 +175,65 @@ function parseGtmObject(gtmData) {
     return `"${arg}"`;
   };
 
+  // 2. Parse Predicates (Conditions)
+  // We now return an object { string: "Human readable", raw: {}, type: 'event'|'other' }
   const parsedPredicates = predicates.map((pred, i) => {
     try {
-      const op = pred.function.replace(/^_/, '');
+      const opCode = pred.function;
+      const op = operatorMap[opCode] || opCode.replace(/^_/, '');
       const arg0 = parseArg(pred.arg0);
       const arg1 = parseArg(pred.arg1);
-      return `${arg0} ${op} ${arg1}`;
-    } catch (e) { return `Error parsing predicate ${i}`; }
+      
+      let readable = `${arg0} ${op} ${arg1}`;
+      
+      // Check if this is an Event condition
+      let type = 'other';
+      if (arg0 === '[Event Name]' && opCode === '_eq') {
+         type = 'event';
+         // Clean up the event name (remove quotes for lookup)
+         const rawEvent = String(pred.arg1).replace(/"/g, '');
+         if (eventMap[rawEvent]) {
+            readable = `Event equals ${eventMap[rawEvent]}`;
+         }
+      }
+      
+      return { text: readable, raw: pred, type: type, arg1: pred.arg1 };
+    } catch (e) { 
+        return { text: `Error parsing predicate ${i}`, raw: pred, type: 'error' }; 
+    }
   });
 
+  // 3. Parse Rules (Triggers)
   const parsedRules = rules.map((rule, i) => {
     try {
       const conditionIndices = rule[0].filter(item => item !== "if");
-      const conditions = conditionIndices.map(index => parsedPredicates[index] || `Predicate ${index}`);
+      
+      let name = `Trigger ${i}`;
+      let conditions = [];
+      let customEventName = null;
+
+      // Scan conditions to find the Event Name to use as the header
+      conditionIndices.forEach(index => {
+          const pred = parsedPredicates[index];
+          if (pred && pred.type === 'event') {
+             const rawEvent = String(pred.arg1).replace(/"/g, ''); // "gtm.click" -> gtm.click
+             // Use the map if available, otherwise use the custom event name
+             name = eventMap[rawEvent] || `Event: ${rawEvent}`;
+             // Don't add this to the visible conditions list (it's in the header now)
+          } else {
+             conditions.push(pred ? pred.text : `Predicate ${index}`);
+          }
+      });
+      
+      // Fallback if no event condition found
+      if (name === `Trigger ${i}`) name = "Custom Trigger";
+
       const tagsToAdd = rule[1].filter(item => item !== "add");
       const rawPredicates = conditionIndices.map(index => predicates[index] || { error: `Predicate ${index} not found` });
+
       return {
-        name: `Trigger ${i}`,
-        conditions: conditions,
+        name: name,
+        conditions: conditions, // Only contains non-event conditions now
         tagsToFire: tagsToAdd,
         raw: { "trigger-conditions": rawPredicates, "tags-to-fire": tagsToAdd }
       };
@@ -104,43 +242,58 @@ function parseGtmObject(gtmData) {
     }
   });
 
+  // 4. Parse Tags
   const parsedTags = tags.map((tag, i) => {
     let name;
     let details = [];
+    let isListener = false; // Flag for sorting
+
+    // Listeners check
+    if (['__cl', '__fsl', '__lcl', '__evl', '__ytl', '__tl', '__sdl'].includes(tag.function)) {
+        isListener = true;
+    }
 
     if (tag.function === "__paused") {
       const originalType = tag.vtp_originalTagType || "unknown";
-      const originalName = getTagName({ function: `__${originalType}` });
+      let originalName;
+      if (originalType.startsWith("cvt_")) {
+         originalName = inferTemplateName(`__${originalType}`, permissions); 
+      } else {
+         originalName = getTagName({ function: `__${originalType}` }); // Use getTagName not getStandard
+      }
       name = `${originalName} (Paused)`;
-      details.push("This tag is paused and will not fire.");
+      details.push("This tag is paused.");
     } else {
-      name = getTagName(tag);
+      if (tag.function.startsWith("__cvt_")) {
+        name = inferTemplateName(tag.function, permissions);
+        const perms = permissions[tag.function];
+        if (perms) {
+          if (perms.inject_script) details.push(`<strong>Injects:</strong> ${perms.inject_script.urls.join(', ')}`);
+          if (perms.access_globals) {
+            const keys = perms.access_globals.keys.map(k => k.key).join(', ');
+            details.push(`<strong>Globals:</strong> ${keys}`);
+          }
+          if (perms.send_pixel) details.push(`<strong>Pixels:</strong> ${perms.send_pixel.urls.join(', ')}`);
+        }
+      } else {
+        name = getTagName(tag);
+      }
+      
       try {
         switch (tag.function) {
           case "__gaawe":
-            details.push(`Event Name: ${tag.vtp_eventName}`);
-            details.push(`Measurement ID: ${tag.vtp_measurementIdOverride}`);
+            details.push(`Event: ${tag.vtp_eventName}`);
+            details.push(`ID: ${tag.vtp_measurementIdOverride}`);
             break;
           case "__ua":
-            details.push(`Track Type: ${tag.vtp_trackType}`);
+            details.push(`Type: ${tag.vtp_trackType}`);
             if (tag.vtp_gaSettings && parsedMacros[tag.vtp_gaSettings[1]]) {
-                details.push(`GA Settings: [${parsedMacros[tag.vtp_gaSettings[1]].name}]`);
+                details.push(`Settings: [${parsedMacros[tag.vtp_gaSettings[1]].name}]`);
             }
             break;
-          case "__googtag":
-            details.push(`Measurement ID: ${tag.vtp_tagId}`);
-            break;
-          case "__awct":
-            details.push(`Conversion ID: ${tag.vtp_conversionId}`);
-            details.push(`Conversion Label: ${tag.vtp_conversionLabel}`);
-            break;
-          case "__asp":
-            details.push(`Pixel ID: ${tag.vtp_pixelId}`);
-            break;
-          default:
-            if (tag.function.startsWith("__cvt_") && tag.vtp_eventName) {
-              details.push(`Event Name: ${tag.vtp_eventName}`);
-            }
+          case "__googtag": details.push(`ID: ${tag.vtp_tagId}`); break;
+          case "__awct": details.push(`ID: ${tag.vtp_conversionId}`); break;
+          case "__asp": details.push(`Pixel ID: ${tag.vtp_pixelId}`); break;
         }
       } catch (e) { }
     }
@@ -150,7 +303,7 @@ function parseGtmObject(gtmData) {
     const usedVariables = [...usedVariableIndices].map(index => parsedMacros[index]).filter(Boolean);
 
     return { 
-      name, details, triggers: firingTriggers, variables: usedVariables, raw: tag
+      name, details, triggers: firingTriggers, variables: usedVariables, raw: tag, isListener
     };
   });
 
@@ -178,7 +331,11 @@ function createItem(item) {
     const details = document.createElement('div');
     details.className = 'item-details';
     const ul = document.createElement('ul');
-    item.details.forEach(d => { const li = document.createElement('li'); li.innerText = d; ul.appendChild(li); });
+    item.details.forEach(d => { 
+        const li = document.createElement('li'); 
+        li.innerHTML = d; 
+        ul.appendChild(li); 
+    });
     details.appendChild(ul);
     div.appendChild(details);
   }
@@ -225,9 +382,22 @@ function displayData(data, containerId) {
   
   const tagsList = document.getElementById('tags-list');
   tagsList.innerHTML = '';
-  document.getElementById('tags-count').innerText = data.tags.length;
-  data.tags.sort((a, b) => a.name.localeCompare(b.name));
-  data.tags.forEach(tag => tagsList.appendChild(createItem(tag)));
+  
+  const listenersList = document.getElementById('listeners-list');
+  listenersList.innerHTML = '';
+
+  // *** NEW: Split tags and listeners ***
+  const standardTags = data.tags.filter(t => !t.isListener);
+  const listenerTags = data.tags.filter(t => t.isListener);
+
+  document.getElementById('tags-count').innerText = standardTags.length;
+  document.getElementById('listeners-count').innerText = listenerTags.length;
+
+  standardTags.sort((a, b) => a.name.localeCompare(b.name));
+  standardTags.forEach(tag => tagsList.appendChild(createItem(tag)));
+
+  listenerTags.sort((a, b) => a.name.localeCompare(b.name));
+  listenerTags.forEach(tag => listenersList.appendChild(createItem(tag)));
 
   const triggersList = document.getElementById('triggers-list');
   triggersList.innerHTML = '';
@@ -317,14 +487,11 @@ function resetUI() {
   setStatus('Waiting for containers...');
 }
 
-// 1. Scan DOM and JS objects for Containers
 function scanForContainers() {
-  // We use 'eval' to access the inspected window's 'google_tag_manager' object
   chrome.devtools.inspectedWindow.eval(
     `
     (function() {
       var results = [];
-      // 1. Check google_tag_manager object
       if (window.google_tag_manager) {
         Object.keys(window.google_tag_manager).forEach(key => {
           if (key.match(/^(GTM|G|AW|DC)-[A-Z0-9]+$/)) {
@@ -332,7 +499,6 @@ function scanForContainers() {
           }
         });
       }
-      // 2. Check Script Tags (to find proxied URLs)
       var scripts = document.querySelectorAll('script[src*="id=GTM-"], script[src*="id=G-"], script[src*="id=AW-"], script[src*="id=DC-"]');
       scripts.forEach(s => {
          var match = s.src.match(/id=([A-Z0-9-]+)/);
@@ -352,7 +518,6 @@ function scanForContainers() {
           detectedContainers[res.id] = { url: res.url || null };
           foundNew = true;
         } else if (res.url && !detectedContainers[res.id].url) {
-          // Upgrade info if we found a URL for an existing ID
           detectedContainers[res.id].url = res.url;
         }
       });
@@ -372,9 +537,7 @@ function updateDropdown() {
     return;
   }
 
-  // Keep the current selection if possible
   const currentVal = select.value;
-  
   let html = '<option value="" disabled>Select a container...</option>';
   ids.forEach(id => {
     const label = detectedContainers[id].url ? `${id} (Found)` : `${id} (Detected in JS)`;
@@ -387,13 +550,12 @@ function updateDropdown() {
   if (currentVal && (ids.includes(currentVal) || currentVal === 'other')) {
     select.value = currentVal;
   } else {
-    select.value = ""; // Reset if previous selection is gone
+    select.value = "";
   }
   
   if (ids.length > 0) setStatus(`Found ${ids.length} container(s).`);
 }
 
-// 2. Load Logic
 async function loadSelectedContainer() {
   const select = document.getElementById('container-select');
   const id = select.value;
@@ -409,13 +571,10 @@ async function loadSelectedContainer() {
       return;
     }
   } else {
-    // It's a discovered ID
     const info = detectedContainers[id];
     if (info && info.url) {
       urlToFetch = info.url;
     } else {
-      // Fallback: If we saw the ID in JS but never found a script tag, try standard Google URL
-      // This handles cases where it might be hidden or injected dynamically without a src
       urlToFetch = `https://www.googletagmanager.com/gtm.js?id=${id}`;
       setStatus(`No script tag found for ${id}. Trying standard URL...`);
     }
@@ -428,7 +587,6 @@ async function loadSelectedContainer() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const text = await response.text();
     
-    // Determine ID for display if Manual
     let displayId = id;
     if (id === 'other') {
        const match = urlToFetch.match(/id=([A-Z0-9-]+)/);
@@ -448,16 +606,11 @@ document.addEventListener('DOMContentLoaded', () => {
   sandboxFrame = document.getElementById('sandbox-iframe');
   
   resetUI();
-  
-  // Attempt initial scan
   scanForContainers();
-  // Poll for containers (GTM might load late)
   setInterval(scanForContainers, 2000);
 
-  // Listen for Network requests (to catch them early)
   chrome.devtools.network.onRequestFinished.addListener((request) => {
     const url = request.request.url;
-    // Loose match for GTM-like URLs
     if (url.includes('gtm.js') || url.match(/[?&]id=(GTM|G|AW|DC)-/)) {
       const match = url.match(/[?&]id=([A-Z0-9-]+)/);
       if (match) {
@@ -473,7 +626,6 @@ document.addEventListener('DOMContentLoaded', () => {
     scanForContainers();
   });
 
-  // UI Events
   document.getElementById('container-select').addEventListener('change', (e) => {
     const isOther = e.target.value === 'other';
     document.getElementById('manual-input-row').style.display = isOther ? 'flex' : 'none';
@@ -486,7 +638,6 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.devtools.inspectedWindow.reload();
   });
 
-  // Modal delegation
   document.body.addEventListener('click', (event) => {
     if (event.target.classList.contains('item-name')) {
       const jsonString = event.target.dataset.json;
@@ -501,7 +652,6 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.modal-close').onclick = () => modal.style.display = "none";
   window.onclick = (e) => { if (e.target == modal) modal.style.display = "none"; };
 
-  // Export
   document.getElementById('exportButton').addEventListener('click', () => {
     if (!fullGtmData) return;
     const blob = new Blob([JSON.stringify(fullGtmData, null, 2)], { type: 'application/json' });
