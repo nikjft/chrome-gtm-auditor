@@ -61,6 +61,9 @@ const eventMap = {
   'gtm.init_consent': 'Consent Initialization'
 };
 
+// List of all standard built-in GTM Listener/Grouping functions
+const listenerFunctions = ['__cl', '__fsl', '__lcl', '__evl', '__ytl', '__tl', '__sdl', '__hl', '__jel', '__tg'];
+
 // --- Helper Functions ---
 
 function findMacroIndices(obj, indices = new Set()) {
@@ -119,10 +122,18 @@ function getTagName(tag) {
     case "__evl": return "Element Visibility Listener";
     case "__ytl": return "YouTube Video Listener";
     case "__tg": return "Trigger Group";
+    // *** NEW LISTENER TAGS ***
+    case "__hl": return "History Change Listener"; 
+    case "__jel": return "JavaScript Error Listener";
+    case "__tl": return "Timer Listener";
+    case "__sdl": return "Scroll Depth Listener";
     default: return `Custom Tag: ${tag.function}`;
   }
 }
 
+/**
+ * Parses the object from the sandbox into a human-readable format.
+ */
 function parseGtmObject(gtmData) {
   const resource = gtmData.resource;
   if (!resource) throw new Error("Parsed data does not contain a 'resource' object.");
@@ -139,7 +150,6 @@ function parseGtmObject(gtmData) {
     try {
       switch (macro.function) {
         case "__v": 
-            // Map known GTM vars to clean names
             const rawName = macro.vtp_name;
             name = variableNameMap[rawName] ? `${variableNameMap[rawName]}` : `Data Layer: ${rawName}`; 
             break;
@@ -158,7 +168,7 @@ function parseGtmObject(gtmData) {
         case "__hid": name = "HTML ID"; break;
         default:
           if (macro.function.startsWith("__cvt_")) {
-            name = inferTemplateName(macro.function, permissions).replace(' (Template)', ''); // Cleaner name for vars
+            name = inferTemplateName(macro.function, permissions).replace(' (Template)', '');
           } else {
             name = `Custom Variable: ${macro.function}`;
           }
@@ -170,13 +180,13 @@ function parseGtmObject(gtmData) {
   const parseArg = (arg) => {
     if (Array.isArray(arg) && arg[0] === "macro") {
       const macro = parsedMacros[arg[1]];
-      return `[${(macro && macro.name) || `Macro ${arg[1]}`}]`;
+      return (macro && macro.name) || `Macro ${arg[1]}`;
     }
-    return `"${arg}"`;
+    // Return quoted string literal
+    return `"${arg}"`; 
   };
 
   // 2. Parse Predicates (Conditions)
-  // We now return an object { string: "Human readable", raw: {}, type: 'event'|'other' }
   const parsedPredicates = predicates.map((pred, i) => {
     try {
       const opCode = pred.function;
@@ -185,18 +195,30 @@ function parseGtmObject(gtmData) {
       const arg1 = parseArg(pred.arg1);
       
       let readable = `${arg0} ${op} ${arg1}`;
-      
-      // Check if this is an Event condition
       let type = 'other';
-      if (arg0 === '[Event Name]' && opCode === '_eq') {
+      
+      // Clean up common variable names in conditions
+      const cleanedVarName = arg0.replace(/\[Data Layer: gtm\.(.*)\]/, '$1');
+
+      if (arg0 === 'Event Name' && opCode === '_eq') {
          type = 'event';
-         // Clean up the event name (remove quotes for lookup)
          const rawEvent = String(pred.arg1).replace(/"/g, '');
          if (eventMap[rawEvent]) {
             readable = `Event equals ${eventMap[rawEvent]}`;
+         } else {
+            readable = `Event equals ${rawEvent}`; // Custom Event
          }
+      } else if (variableNameMap[cleanedVarName]) {
+          // Simplify known variable conditions: [Click Classes] contains "MuiButton"
+          readable = `${variableNameMap[cleanedVarName]} ${op} ${arg1}`;
+      } else if (arg0.startsWith('Auto-Event')) {
+          // Simplify Auto-Event: Auto-Event: TEXT = "Join Now"
+          readable = `${arg0.split(':')[1].trim()} ${op} ${arg1}`;
+      } else if (arg0.startsWith('URL:')) {
+          // Simplify URL condition: URL: Path = "/membership"
+          readable = `${arg0.split(':')[0].trim()} ${op} ${arg1}`;
       }
-      
+
       return { text: readable, raw: pred, type: type, arg1: pred.arg1 };
     } catch (e) { 
         return { text: `Error parsing predicate ${i}`, raw: pred, type: 'error' }; 
@@ -210,30 +232,26 @@ function parseGtmObject(gtmData) {
       
       let name = `Trigger ${i}`;
       let conditions = [];
-      let customEventName = null;
 
-      // Scan conditions to find the Event Name to use as the header
+      // Scan conditions to find the Event Name to use as the header and filter it out
       conditionIndices.forEach(index => {
           const pred = parsedPredicates[index];
           if (pred && pred.type === 'event') {
-             const rawEvent = String(pred.arg1).replace(/"/g, ''); // "gtm.click" -> gtm.click
-             // Use the map if available, otherwise use the custom event name
-             name = eventMap[rawEvent] || `Event: ${rawEvent}`;
-             // Don't add this to the visible conditions list (it's in the header now)
+             const rawEvent = String(pred.arg1).replace(/"/g, '');
+             name = eventMap[rawEvent] || `Custom Event: ${rawEvent}`;
           } else {
              conditions.push(pred ? pred.text : `Predicate ${index}`);
           }
       });
       
-      // Fallback if no event condition found
-      if (name === `Trigger ${i}`) name = "Custom Trigger";
+      if (name === `Trigger ${i}`) name = "Custom Trigger"; // Fallback if no event condition found
 
       const tagsToAdd = rule[1].filter(item => item !== "add");
       const rawPredicates = conditionIndices.map(index => predicates[index] || { error: `Predicate ${index} not found` });
 
       return {
-        name: name,
-        conditions: conditions, // Only contains non-event conditions now
+        name: name, // Human readable header name
+        conditions: conditions, // Only contains non-event conditions
         tagsToFire: tagsToAdd,
         raw: { "trigger-conditions": rawPredicates, "tags-to-fire": tagsToAdd }
       };
@@ -246,10 +264,10 @@ function parseGtmObject(gtmData) {
   const parsedTags = tags.map((tag, i) => {
     let name;
     let details = [];
-    let isListener = false; // Flag for sorting
+    let isListener = false;
 
-    // Listeners check
-    if (['__cl', '__fsl', '__lcl', '__evl', '__ytl', '__tl', '__sdl', '__hl'].includes(tag.function)) {
+    // Check if the tag is one of the auto-injected listeners/groupers
+    if (listenerFunctions.includes(tag.function)) { 
         isListener = true;
     }
 
@@ -259,7 +277,7 @@ function parseGtmObject(gtmData) {
       if (originalType.startsWith("cvt_")) {
          originalName = inferTemplateName(`__${originalType}`, permissions); 
       } else {
-         originalName = getTagName({ function: `__${originalType}` }); // Use getTagName not getStandard
+         originalName = getTagName({ function: `__${originalType}` });
       }
       name = `${originalName} (Paused)`;
       details.push("This tag is paused.");
@@ -373,7 +391,6 @@ function createItem(item) {
   return div;
 }
 
-// --- Main Display Function ---
 function displayData(data, containerId) {
   fullGtmData = data;
   setStatus('');
@@ -386,7 +403,6 @@ function displayData(data, containerId) {
   const listenersList = document.getElementById('listeners-list');
   listenersList.innerHTML = '';
 
-  // *** NEW: Split tags and listeners ***
   const standardTags = data.tags.filter(t => !t.isListener);
   const listenerTags = data.tags.filter(t => t.isListener);
 
@@ -402,6 +418,7 @@ function displayData(data, containerId) {
   const triggersList = document.getElementById('triggers-list');
   triggersList.innerHTML = '';
   document.getElementById('triggers-count').innerText = data.triggers.length;
+  data.triggers.sort((a, b) => a.name.localeCompare(b.name)); // Sort triggers by their new derived name
   data.triggers.forEach(trigger => triggersList.appendChild(createItem(trigger)));
 
   const variablesList = document.getElementById('variables-list');
@@ -629,6 +646,9 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('container-select').addEventListener('change', (e) => {
     const isOther = e.target.value === 'other';
     document.getElementById('manual-input-row').style.display = isOther ? 'flex' : 'none';
+    if (!isOther && e.target.value) {
+        loadSelectedContainer();
+    }
   });
 
   document.getElementById('load-btn').addEventListener('click', loadSelectedContainer);
